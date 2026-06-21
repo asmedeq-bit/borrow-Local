@@ -491,6 +491,7 @@ from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
 }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 
@@ -1057,6 +1058,7 @@ from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
       </div>
       <div style="margin-left:auto;display:flex;gap:6px">
         <button class="btn bp sm" id="admRefreshBtn" onclick="adminRefresh()">🔄 Refresh</button>
+        <button class="btn bg sm" id="admSyncXlsxBtn" onclick="handleManualXlsxSync()">📊 ซิงค์ Excel ใหม่</button>
         <button class="btn bg sm" onclick="document.getElementById('admImportFileInput').click()">⬆️ Import ไฟล์</button>
         <input type="file" id="admImportFileInput" accept=".json,.xlsx" style="display:none" onchange="handleAdminImportFile(event)">
         <button class="btn bg sm" onclick="lockAdmin()">🔒 ออก</button>
@@ -2537,6 +2539,7 @@ var _DB = {
 var _dirHandle = null;
 var _fileHandle = null;
 var _isSaving = false;
+var _isSavingXlsx = false; // lock แยกสำหรับ xlsx กันเขียนซ้อนกันถ้าบันทึกถี่ๆ
 var _hasUnsavedChanges = false;
 var _dbReady = false;
 
@@ -2731,8 +2734,17 @@ async function writeDbFile(doBackupFirst) {
     _hasUnsavedChanges = false;
 
     // เขียน Excel คู่ขนาน (best-effort — ไม่บล็อกการบันทึกหลักถ้าล้มเหลว)
+    // ใช้ bigToast (ไม่ใช่ toast เล็กมุมจอ) เพราะ toast เล็กมักถูกบดบังด้วย
+    // bigToast อื่น (เช่น "ลบสำเร็จ") ที่มักเด้งขึ้นพร้อมกันในจังหวะเดียวกัน
     writeXlsxFile().catch(function(e) {
-      console.warn('เขียนไฟล์ Excel คู่ขนานไม่สำเร็จ (ไฟล์อาจเปิดค้างอยู่):', e);
+      console.warn('เขียนไฟล์ Excel คู่ขนานไม่สำเร็จ:', e);
+      if (typeof bigToast === 'function') {
+        // ลบ bigToast เดิมที่อาจค้างอยู่ก่อน (เช่น "ลบสำเร็จ") กันซ้อนทับกันเป็น 2 ชั้น
+        document.querySelectorAll('[data-bt]').forEach(function(el){ el.remove(); });
+        bigToast('บันทึกข้อมูลสำเร็จ\nแต่อัปเดต database.xlsx ไม่สำเร็จ\nกรุณาปิดไฟล์ Excel แล้วบันทึกอีกครั้ง\n(หรือกดปุ่ม "ซิงค์ Excel ใหม่" ในหน้า Admin)','warning');
+      } else if (typeof toast === 'function') {
+        toast('บันทึกข้อมูลสำเร็จ แต่อัปเดต database.xlsx ไม่สำเร็จ (ไฟล์อาจเปิดค้างอยู่)', 'warning');
+      }
     });
 
     return true;
@@ -2766,33 +2778,49 @@ async function writeBackupFile() {
 }
 
 async function writeXlsxFile() {
-  if (typeof XLSX === 'undefined' || !_dirHandle) return;
+  if (!_dirHandle) return;
+  if (typeof XLSX === 'undefined') {
+    throw new Error('ไลบรารี XLSX ยังไม่โหลด (ตรวจสอบการเชื่อมต่อ internet ตอนเปิดหน้าครั้งแรก หรือ CDN ถูกบล็อก)');
+  }
 
-  var loanRows = _DB.loan_requests.map(function(l) {
-    var eqText = (l.equipment_list || []).map(function(e) { return e.name + ' x' + (e.qty || 1); }).join('; ');
-    return {
-      'LoanID': l.loan_id, 'วันที่ยืม': l.loan_date, 'ผู้ป่วย': l.patient_name,
-      'แผนก': l.dept_name, 'รหัสแผนก': l.dept_code, 'ผู้ให้ยืม': l.borrower_name,
-      'เครื่องมือ': eqText, 'สถานะ': l.status, 'บันทึกเมื่อ': l.created_at,
-    };
-  });
-  var borrowRows = _DB.borrow_records.map(function(b) {
-    return {
-      'RecordID': b.record_id, 'LoanID': b.loan_id, 'หมายเลขเครื่อง': b.equipment_no,
-      'ลำดับเครื่องมือ': b.equip_item_index, 'ผู้ให้ยืม': b.giver_name, 'ผู้รับคืน': b.receiver_name || '',
-      'วันที่คืน': b.return_date || '', 'คืนเครื่องแล้ว': b.machine_returned ? 'ใช่' : 'ไม่ใช่', 'สถานะ': b.status,
-    };
-  });
+  // กันเขียนไฟล์ซ้อนกัน (เช่น บันทึกถี่ๆ ติดกัน) — รอให้รอบก่อนเขียนเสร็จก่อนเสมอ
+  // ป้องกันไฟล์ .xlsx เสียหายจาก 2 การเขียนพร้อมกันบน handle เดียวกัน
+  if (_isSavingXlsx) {
+    await new Promise(function(r) {
+      var iv = setInterval(function() { if (!_isSavingXlsx) { clearInterval(iv); r(); } }, 50);
+    });
+  }
+  _isSavingXlsx = true;
 
-  var wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(loanRows), 'ใบยืม');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(borrowRows), 'บันทึกยืม-คืน');
-  var wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  try {
+    var loanRows = _DB.loan_requests.map(function(l) {
+      var eqText = (l.equipment_list || []).map(function(e) { return e.name + ' x' + (e.qty || 1); }).join('; ');
+      return {
+        'LoanID': l.loan_id, 'วันที่ยืม': l.loan_date, 'ผู้ป่วย': l.patient_name,
+        'แผนก': l.dept_name, 'รหัสแผนก': l.dept_code, 'ผู้ให้ยืม': l.borrower_name,
+        'เครื่องมือ': eqText, 'สถานะ': l.status, 'บันทึกเมื่อ': l.created_at,
+      };
+    });
+    var borrowRows = _DB.borrow_records.map(function(b) {
+      return {
+        'RecordID': b.record_id, 'LoanID': b.loan_id, 'หมายเลขเครื่อง': b.equipment_no,
+        'ลำดับเครื่องมือ': b.equip_item_index, 'ผู้ให้ยืม': b.giver_name, 'ผู้รับคืน': b.receiver_name || '',
+        'วันที่คืน': b.return_date || '', 'คืนเครื่องแล้ว': b.machine_returned ? 'ใช่' : 'ไม่ใช่', 'สถานะ': b.status,
+      };
+    });
 
-  var xh = await _dirHandle.getFileHandle(XLSX_FILE_NAME, { create: true });
-  var writable = await xh.createWritable();
-  await writable.write(wbout);
-  await writable.close();
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(loanRows), 'ใบยืม');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(borrowRows), 'บันทึกยืม-คืน');
+    var wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+
+    var xh = await _dirHandle.getFileHandle(XLSX_FILE_NAME, { create: true });
+    var writable = await xh.createWritable();
+    await writable.write(wbout);
+    await writable.close();
+  } finally {
+    _isSavingXlsx = false;
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -5834,6 +5862,32 @@ async function runArchiveMove(){
 // ── Import ไฟล์ database.json หรือ .xlsx เก่าเข้าระบบ ──────────
 // ใช้สำหรับกรณีย้ายเครื่อง หรือกู้ข้อมูลจาก backup — รวมกับข้อมูลปัจจุบัน
 // (รายการที่ loan_id/record_id ซ้ำกัน จะใช้ตัวที่ updated_at ล่าสุด)
+// ── ซิงค์ database.xlsx ใหม่ด้วยตนเอง ──────────────────────────
+// ใช้แก้กรณี Excel เขียนไม่สำเร็จก่อนหน้านี้ (เช่น ไฟล์ถูกเปิดค้างไว้)
+// โดยไม่ต้องไปแก้ไขข้อมูลอื่นเพื่อ trigger การเขียนใหม่
+async function handleManualXlsxSync(){
+  if(!_dirHandle){alert('ยังไม่ได้เชื่อมต่อโฟลเดอร์ฐานข้อมูล');return;}
+  var btn=document.getElementById('admSyncXlsxBtn');
+  var origText=btn?btn.textContent:'';
+  if(btn){btn.disabled=true;btn.textContent='⏳ กำลังซิงค์...';}
+  try{
+    await writeXlsxFile();
+    if(typeof bigToast==='function'){
+      document.querySelectorAll('[data-bt]').forEach(function(el){el.remove();});
+      bigToast('ซิงค์ database.xlsx สำเร็จ','success');
+    }
+  }catch(e){
+    if(typeof bigToast==='function'){
+      document.querySelectorAll('[data-bt]').forEach(function(el){el.remove();});
+      bigToast('ซิงค์ database.xlsx ไม่สำเร็จ\\n'+e.message+'\\nกรุณาปิดไฟล์ Excel แล้วลองอีกครั้ง','error');
+    }else{
+      alert('ซิงค์ Excel ไม่สำเร็จ: '+e.message);
+    }
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent=origText;}
+  }
+}
+
 async function handleAdminImportFile(ev){
   var file=ev.target.files[0];
   if(!file)return;
